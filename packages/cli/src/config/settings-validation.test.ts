@@ -300,6 +300,33 @@ describe('settings-validation', () => {
       }
     });
 
+    it('should accept customThemes with ui.focus and ui.active color overrides', () => {
+      // `ui.focus` and `ui.active` are declared on the CustomTheme interface and
+      // are read when a theme is resolved (see `ui.focus` -> FocusColor and
+      // `ui.active` in packages/cli/src/ui/themes/theme.ts), but the CustomTheme
+      // validation schema sets `additionalProperties: false` on `ui` without
+      // listing them, so a theme using either key is rejected at startup. This is
+      // the same defect #25610 fixed for `text.response`.
+      const validSettings = {
+        ui: {
+          theme: 'FocusTest',
+          customThemes: {
+            FocusTest: {
+              type: 'custom',
+              name: 'FocusTest',
+              ui: {
+                focus: '#00FFFF',
+                active: '#0000FF',
+              },
+            },
+          },
+        },
+      };
+
+      const result = validateSettings(validSettings);
+      expect(result.success).toBe(true);
+    });
+
     it('should accept customThemes with text.response color override', () => {
       // Regression test for #25610: `response` is a documented and
       // implemented color override for model responses (see
