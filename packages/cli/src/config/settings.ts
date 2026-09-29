@@ -237,6 +237,57 @@ function setNestedProperty(
   current[lastKey] = value;
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The value to persist for a settings subtree that a migration rewrote.
+ *
+ * `originalSettings` is what gets written back to the settings file, and it
+ * holds the values as they were written, with `${VAR}` placeholders still in
+ * place. A migration builds its new subtree from `settings`, the view with the
+ * placeholders already expanded, so persisting that subtree as it stands would
+ * replace every placeholder next to a migrated key with whatever it happened to
+ * expand to. Only the paths in `migratedPaths`, the ones the migration actually
+ * wrote or deleted, take the migrated value; every other key keeps what is on
+ * disk.
+ */
+function keepUnexpandedValues(
+  raw: unknown,
+  migrated: Record<string, unknown>,
+  migratedPaths: readonly string[],
+): Record<string, unknown> {
+  if (!isPlainRecord(raw)) {
+    return migrated;
+  }
+
+  const result: Record<string, unknown> = structuredClone(migrated);
+
+  const walk = (
+    rawNode: Record<string, unknown>,
+    migratedNode: Record<string, unknown>,
+    prefix: string,
+  ) => {
+    for (const [key, rawValue] of Object.entries(rawNode)) {
+      const path = prefix ? `${prefix}.${key}` : key;
+      if (migratedPaths.includes(path) || !(key in migratedNode)) {
+        // Migrated, or removed by the migration: the migrated subtree decides.
+        continue;
+      }
+      const migratedValue = migratedNode[key];
+      if (isPlainRecord(rawValue) && isPlainRecord(migratedValue)) {
+        walk(rawValue, migratedValue, path);
+      } else {
+        setNestedProperty(result, path, structuredClone(rawValue));
+      }
+    }
+  };
+
+  walk(raw, migrated, '');
+  return result;
+}
+
 export function getDefaultsFromSchema(
   schema: SettingsSchema = getSettingsSchema(),
 ): Settings {
@@ -475,6 +526,46 @@ export class LoadedSettings {
         settingsFile.originalSettings,
         key,
         structuredClone(valueToSet),
+      );
+      saveSettings(settingsFile);
+    }
+
+    this._merged = this.computeMergedSettings();
+    this._snapshot = this.computeSnapshot();
+    coreEvents.emitSettingsChanged();
+  }
+
+  /**
+   * Writes a settings subtree that a migration rewrote.
+   *
+   * `migratedPaths` names the paths within the subtree that the migration
+   * wrote or deleted, relative to the subtree. The runtime view takes the
+   * migrated subtree as it stands; the value that gets persisted keeps the
+   * unexpanded value of every other key, so a `${VAR}` placeholder in the file
+   * is not replaced by the value it expanded to.
+   */
+  setMigratedValue(
+    scope: LoadableSettingScope,
+    key: string,
+    migrated: Record<string, unknown>,
+    migratedPaths: readonly string[],
+  ): void {
+    const settingsFile = this.forScope(scope);
+
+    setNestedProperty(settingsFile.settings, key, structuredClone(migrated));
+
+    if (this.isPersistable(settingsFile)) {
+      setNestedProperty(
+        settingsFile.originalSettings,
+        key,
+        keepUnexpandedValues(
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion
+          (settingsFile.originalSettings as unknown as Record<string, unknown>)[
+            key
+          ],
+          migrated,
+          migratedPaths,
+        ),
       );
       saveSettings(settingsFile);
     }
@@ -1043,6 +1134,7 @@ export function migrateDeprecatedSettings(
     newKey: string,
     prefix: string,
     foundDeprecated?: string[],
+    touched?: Set<string>,
   ): boolean => {
     let modified = false;
     const oldValue = settings[oldKey];
@@ -1056,13 +1148,16 @@ export function migrateDeprecatedSettings(
         // Both exist, trust the new one
         if (removeDeprecated) {
           delete settings[oldKey];
+          touched?.add(oldKey);
           modified = true;
         }
       } else {
         // Only old exists, migrate to new (inverted)
         settings[newKey] = !oldValue;
+        touched?.add(newKey);
         if (removeDeprecated) {
           delete settings[oldKey];
+          touched?.add(oldKey);
         }
         modified = true;
       }
@@ -1081,6 +1176,7 @@ export function migrateDeprecatedSettings(
       | undefined;
     if (generalSettings) {
       const newGeneral = { ...generalSettings };
+      const touched = new Set<string>();
       let modified = false;
 
       modified =
@@ -1090,6 +1186,7 @@ export function migrateDeprecatedSettings(
           'enableAutoUpdate',
           'general',
           foundDeprecated,
+          touched,
         ) || modified;
       modified =
         migrateBoolean(
@@ -1098,10 +1195,13 @@ export function migrateDeprecatedSettings(
           'enableAutoUpdateNotification',
           'general',
           foundDeprecated,
+          touched,
         ) || modified;
 
       if (modified) {
-        loadedSettings.setValue(scope, 'general', newGeneral);
+        loadedSettings.setMigratedValue(scope, 'general', newGeneral, [
+          ...touched,
+        ]);
         if (!settingsFile.readOnly) {
           anyModified = true;
         }
@@ -1119,6 +1219,7 @@ export function migrateDeprecatedSettings(
 
       if (accessibilitySettings) {
         const newAccessibility = { ...accessibilitySettings };
+        const touched = new Set<string>();
         if (
           migrateBoolean(
             newAccessibility,
@@ -1126,10 +1227,13 @@ export function migrateDeprecatedSettings(
             'enableLoadingPhrases',
             'ui.accessibility',
             foundDeprecated,
+            touched,
           )
         ) {
           newUi['accessibility'] = newAccessibility;
-          loadedSettings.setValue(scope, 'ui', newUi);
+          loadedSettings.setMigratedValue(scope, 'ui', newUi, [
+            ...[...touched].map((key) => `accessibility.${key}`),
+          ]);
           if (!settingsFile.readOnly) {
             anyModified = true;
           }
@@ -1143,7 +1247,9 @@ export function migrateDeprecatedSettings(
         ) {
           if (!enableLP) {
             newUi['loadingPhrases'] = 'off';
-            loadedSettings.setValue(scope, 'ui', newUi);
+            loadedSettings.setMigratedValue(scope, 'ui', newUi, [
+              'loadingPhrases',
+            ]);
             if (!settingsFile.readOnly) {
               anyModified = true;
             }
@@ -1166,6 +1272,7 @@ export function migrateDeprecatedSettings(
 
       if (fileFilteringSettings) {
         const newFileFiltering = { ...fileFilteringSettings };
+        const touched = new Set<string>();
         if (
           migrateBoolean(
             newFileFiltering,
@@ -1173,10 +1280,13 @@ export function migrateDeprecatedSettings(
             'enableFuzzySearch',
             'context.fileFiltering',
             foundDeprecated,
+            touched,
           )
         ) {
           newContext['fileFiltering'] = newFileFiltering;
-          loadedSettings.setValue(scope, 'context', newContext);
+          loadedSettings.setMigratedValue(scope, 'context', newContext, [
+            ...[...touched].map((key) => `fileFiltering.${key}`),
+          ]);
           if (!settingsFile.readOnly) {
             anyModified = true;
           }
@@ -1197,7 +1307,9 @@ export function migrateDeprecatedSettings(
         // Only set defaultApprovalMode if it's not already set
         if (newGeneral['defaultApprovalMode'] === undefined) {
           newGeneral['defaultApprovalMode'] = toolsSettings['approvalMode'];
-          loadedSettings.setValue(scope, 'general', newGeneral);
+          loadedSettings.setMigratedValue(scope, 'general', newGeneral, [
+            'defaultApprovalMode',
+          ]);
           if (!settingsFile.readOnly) {
             anyModified = true;
           }
@@ -1206,7 +1318,9 @@ export function migrateDeprecatedSettings(
         if (removeDeprecated) {
           const newTools = { ...toolsSettings };
           delete newTools['approvalMode'];
-          loadedSettings.setValue(scope, 'tools', newTools);
+          loadedSettings.setMigratedValue(scope, 'tools', newTools, [
+            'approvalMode',
+          ]);
           if (!settingsFile.readOnly) {
             anyModified = true;
           }
@@ -1406,21 +1520,31 @@ function migrateExperimentalSettings(
       if (newPlan['enabled'] === undefined) {
         newPlan['enabled'] = planValue;
         newGeneral['plan'] = newPlan;
-        loadedSettings.setValue(scope, 'general', newGeneral);
+        loadedSettings.setMigratedValue(scope, 'general', newGeneral, [
+          'plan.enabled',
+        ]);
         modified = true;
       }
     });
 
     if (modified) {
       agentsSettings['overrides'] = agentsOverrides;
-      loadedSettings.setValue(scope, 'agents', agentsSettings);
+      loadedSettings.setMigratedValue(scope, 'agents', agentsSettings, [
+        'overrides.codebase_investigator',
+        'overrides.cli_help',
+      ]);
 
       if (removeDeprecated) {
         const newExperimental = { ...experimentalSettings };
         delete newExperimental['codebaseInvestigatorSettings'];
         delete newExperimental['cliHelpAgentSettings'];
         delete newExperimental['plan'];
-        loadedSettings.setValue(scope, 'experimental', newExperimental);
+        loadedSettings.setMigratedValue(
+          scope,
+          'experimental',
+          newExperimental,
+          ['codebaseInvestigatorSettings', 'cliHelpAgentSettings', 'plan'],
+        );
       }
       return true;
     }
